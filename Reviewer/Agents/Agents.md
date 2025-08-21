@@ -1,0 +1,8 @@
+- get full diff
+- locally group files based on references.
+- pass group diffs into model
+  - ask for review
+  - ask for a review of each diff
+  - state if there is more details needed it can ask for
+    - full file
+    - full pr diff

@@ -1,0 +1,31 @@
+name: pr-reviewer-devcontainer
+
+networks:
+  default:
+    name: development-network
+    driver: bridge
+
+services:
+  workspace:
+    container_name: workspace
+
+
+    # Setup the working directory for building the workspace container
+    build:
+      context: ./workspace
+      dockerfile: Dockerfile
+      args:
+        VARIANT: "1.2.6-noble"
+
+    # Provide the workspace volume to the container
+    volumes:
+      - ..:/workspaces:cached
+
+    # Pass the local environment variables to the workspace container
+    # many of the values are used within the developed application code.
+    env_file:
+      - .env
+
+    command: sleep infinity
+
+  

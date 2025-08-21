@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Code Reviewer</title>
+    <style>
+      body {
+        font-family: sans-serif;
+        margin: 2em;
+      }
+      #results {
+        border: 1px solid #ccc;
+        padding: 1em;
+        margin-top: 1em;
+        white-space: pre-wrap;
+      }
+      .comment {
+        border-bottom: 1px solid #eee;
+        padding-bottom: 1em;
+        margin-bottom: 1em;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Code Reviewer</h1>
+    <form id="review-form">
+      <label for="repo_name">Repo Name (e.g., owner/repo):</label><br />
+      <input type="text" id="repo_name" name="repo_name" required /><br /><br />
+      <label for="pr_number">PR Number:</label><br />
+      <input
+        type="number"
+        id="pr_number"
+        name="pr_number"
+        required
+      /><br /><br />
+      <button type="submit">Review</button>
+    </form>
+
+    <h2>Results</h2>
+    <div id="progress"></div>
+    <div id="final-review"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script>
+      document
+        .getElementById("review-form")
+        .addEventListener("submit", async function (event) {
+          event.preventDefault();
+
+          const repoName = document.getElementById("repo_name").value;
+          const prNumber = document.getElementById("pr_number").value;
+          const progressDiv = document.getElementById("progress");
+          const finalReviewDiv = document.getElementById("final-review");
+
+          progressDiv.innerHTML = "Starting review...<br>";
+          finalReviewDiv.innerHTML = "";
+
+          const response = await fetch("http://127.0.0.1:8001/review/stream", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              repo_name: repoName,
+              pr_number: parseInt(prNumber),
+            }),
+          });
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) {
+              break;
+            }
+            const chunk = decoder.decode(value);
+            const lines = chunk.split("\n\n");
+
+            for (const line of lines) {
+              if (line.startsWith("data: ")) {
+                const content = line.substring(6);
+                try {
+                  const data = JSON.parse(content);
+                  if (data.type === "complete") {
+                    progressDiv.innerHTML += "Review complete!<br>";
+                    const comments = data.review_comments;
+                    let html = "<h3>Final Review Comments</h3>";
+                    comments.forEach((comment) => {
+                      html += `<div class="comment">
+                                      <p><strong>File:</strong> ${
+                                        comment.file_name
+                                      }</p>
+                                      <p><strong>Rework Required:</strong> ${
+                                        comment.requires_rework
+                                      }</p>
+                                      <div><strong>Comment:</strong><br>${marked.parse(
+                                        comment.review_comment
+                                      )}</div>
+                                      <div><strong>Suggested Improvements:</strong><br>${marked.parse(
+                                        comment.suggested_improvements_markdown
+                                      )}</div>
+                                  </div>`;
+                    });
+                    finalReviewDiv.innerHTML = html;
+                  } else {
+                    // It's JSON but not the 'complete' message
+                    progressDiv.innerHTML += `${JSON.stringify(data)}<br>`;
+                  }
+                } catch (e) {
+                  // It's not JSON, treat as a plain text progress message
+                  progressDiv.innerHTML += `${content}<br>`;
+                }
+              }
+            }
+          }
+        });
+    </script>
+  </body>
+</html>

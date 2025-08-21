@@ -1,0 +1,38 @@
+{
+  "name": "PR Reviewer Dev Container",
+  "dockerComposeFile": "./docker-compose.yml",
+  "service": "workspace",
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": {},
+    "ghcr.io/devcontainers-extra/features/angular-cli:2": {}
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.languageServer": "Pylance",
+        "python.analysis.typeCheckingMode": "basic",
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "esbenp.prettier-vscode"
+      },
+      "extensions": [
+        "github.copilot",
+        "streetsidesoftware.code-spell-checker",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-toolsai.jupyter",
+        "angular.ng-template",
+        "esbenp.prettier-vscode",
+        "ms-azuretools.vscode-docker"
+      ],
+    }
+  },
+  "portsAttributes": {
+    "7096": {
+      "label": "Web Interface",
+      "protocol": "https"
+    },
+  },
+  //"onCreateCommand": "bash onCreate.sh"
+  "postCreateCommand": "bash .devcontainer/postCreate.sh",
+}

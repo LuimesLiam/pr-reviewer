@@ -1,0 +1,18 @@
+# Core agent framework
+langgraph
+langgraph-sdk==0.1.43
+# LangChain for LLM interfaces & ChatOpenAI
+langchain
+langchain-community==0.3.11
+langchain-core==0.3.35
+# Google Gemini
+langchain-google-genai
+flask
+
+asyncio
+
+# FastAPI for web server
+fastapi
+uvicorn
+networkx
+PyGithub
