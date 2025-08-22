@@ -6,5 +6,4 @@ fi
 #install python packages
 sudo pip install -r Reviewer/requirements.txt --break-system-packages
 
-sudo pip install --upgrade langchain-google-genai
-
+sudo pip install --upgrade langchain-google-genai --break-system-packages
