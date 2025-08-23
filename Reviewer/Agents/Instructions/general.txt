@@ -1,0 +1,30 @@
+general pull request review instructions:
+
+1. Scope & Cohesion
+- Ensure PR has a single clear purpose; flag unrelated changes.
+
+2. Readability
+- Names must be descriptive; avoid abbreviations unless standard.
+
+3. Diff Hygiene
+- No leftover debug prints, commented code, or accidental file mode changes.
+
+4. Documentation
+- Update README / CHANGELOG / API docs when behavior or public surface changes.
+
+5. Tests
+- Overall coverage maintained or improved; critical paths tested.
+
+6. Security & Secrets
+- No hardcoded credentials / tokens. Highlight any found.
+
+7. Licensing / Third‑Party
+- New dependencies require justification and compatible license.
+
+8. Performance Flagging
+- Identify obvious inefficiencies (excessive allocations, redundant queries).
+
+9. Accessibility (UI changes)
+- ARIA labels, keyboard nav, color contrast.
+
+10. Output strictly via schema; be concise but specific.

@@ -1,1 +1,36 @@
 python set
+python code review instructions:
+
+1. Style & Formatting
+- Enforce PEP 8 (line length 120 soft cap).
+- Consistent import grouping: stdlib, third-party, local.
+- No unused imports / variables.
+
+2. Typing & Interfaces
+- Prefer explicit type hints everywhere (function signatures, complex variables).
+- Use Protocol / @runtime_checkable when structural typing fits.
+
+3. Docstrings & Comments
+- Public functions/classes need concise docstrings (Google or NumPy style acceptable).
+- Remove obsolete or commented‑out code blocks.
+
+4. Testing
+- New / changed logic must have or update unit tests.
+- Highlight missing edge case tests (None, empty collections, error paths).
+
+5. Error Handling & Logging
+- Avoid bare except; catch specific exceptions.
+- Preserve original trace when re‑raising (use `raise` not `raise e`).
+
+6. Performance & Memory
+- Flag obvious N^2 loops over large collections.
+- Prefer lazy iteration (generators) for large datasets.
+
+7. Security
+- Watch for dangerous eval/exec, shell=True, hardcoded secrets.
+- Validate / sanitize external inputs.
+
+8. Reliability
+- Idempotent functions where appropriate; avoid hidden global state.
+
+9. Return your review as required by the schema. Be explicit if rework is required.

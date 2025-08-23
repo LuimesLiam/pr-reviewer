@@ -1,1 +1,40 @@
-dotnet test
+dotnet / c# code review instructions:
+
+1. Style & Standards
+- Follow .NET conventions: PascalCase (types/methods), camelCase (locals/params), ALL_CAPS (const).
+- Use implicit `var` when the type is obvious from RHS; explicit type when it aids clarity.
+
+2. Project & Architecture
+- Favor dependency injection over static singletons.
+- Interfaces for external boundaries (IEmailSender, IRepository, etc.).
+
+3. Nullability & Safety
+- Nullable reference types should be enabled; avoid `!` unless justified.
+- Guard clauses at method start for invalid args.
+
+4. Async
+- Use async all the way; avoid `.Result` / `.Wait()` deadlocks.
+- Prefer `CancellationToken` parameters for I/O and long operations.
+
+5. Collections & LINQ
+- Avoid multiple enumerations; materialize with `.ToList()` if needed.
+- Push filters/projections server-side (e.g., EF) before calling `.ToList()`.
+
+6. Error Handling
+- Catch only what you can handle; avoid swallowing exceptions.
+- Wrap external service calls with resilience (retry, timeout, circuit breaker) when needed.
+
+7. Performance
+- Avoid synchronous over async I/O.
+- Be cautious with large object allocations / boxing in tight loops.
+
+8. Security
+- Validate user input (model validation attributes / FluentValidation).
+- Parameterize all SQL / avoid string concatenation.
+- Do not log sensitive data.
+
+9. Testing
+- Public logic should have unit tests; complex LINQ queries need coverage.
+- Mock external dependencies; avoid hitting real services in unit tests.
+
+10. Output strictly via schema fields; if rework, enumerate key issues succinctly in markdown section.

@@ -46,18 +46,21 @@ class GeminiLLM(BaseLLM):
         **kwargs,
     ) -> Any:
         # Choose schema (default to the one defined)
-
-        structured_llm = self.llm.with_structured_output(
-            schema=schema,
-            method="function_calling",
-        )
-        chain = prompt | structured_llm
-        response = await chain.ainvoke({"input": prompt})
-
+        try:
+            structured_llm = self.llm.with_structured_output(
+                schema=schema,
+                # method="function_calling",
+            )
+            chain = prompt | structured_llm
+            response = await chain.ainvoke({"input": prompt})
+        except Exception as e:
+            raise e
         return response
 
 
 # Example usage
+
+
 async def main():
     # Initialize your structured Gemini LLM
     llm = GeminiLLM(model="gemini-2.5-flash")
@@ -82,14 +85,14 @@ async def main():
             "followup": {
                     "type": "boolean",
                     "description": "True if the question was a follow-up, false otherwise.",
-            },
+                },
             "visualize": {
                     "type": "string",
                     "description": (
                         "Indicator of when and if the user wants to see a visualization of the answer. "
                         "'previous', 'new', or 'no'."
                     ),
-            },
+                },
         },
         "required": ["ask", "followup", "visualize"],
     }
