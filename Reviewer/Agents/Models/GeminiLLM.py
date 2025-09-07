@@ -35,9 +35,10 @@ class GeminiLLM(BaseLLM):
         return "gemini"
 
     async def _call(self, prompt: ChatPromptTemplate, **kwargs) -> BaseMessage:
+
         chain = prompt | self.llm
-        response = await chain.ainvoke({"input": prompt})
-        return response
+        # kwargs may be empty if the prompt has no variables.
+        return await chain.ainvoke(kwargs or {})
 
     async def _invoke_structured_output(
         self,
@@ -45,14 +46,12 @@ class GeminiLLM(BaseLLM):
         schema: Dict,
         **kwargs,
     ) -> Any:
-        # Choose schema (default to the one defined)
         try:
             structured_llm = self.llm.with_structured_output(
                 schema=schema,
-                # method="function_calling",
             )
             chain = prompt | structured_llm
-            response = await chain.ainvoke({"input": prompt})
+            response = await chain.ainvoke(kwargs or {})
         except Exception as e:
             raise e
         return response
@@ -65,7 +64,7 @@ async def main():
     # Initialize your structured Gemini LLM
     llm = GeminiLLM(model="gemini-2.5-flash")
 
-    # Prepare a simple chat prompt
+    # Prepare a simple chat prompt (no variables required)
     system_message = "You are an analytics assistant that summarizes user asks."
     user_message = "I want to analyze customer churn rates for Q2 and visualize new charts."
     prompt = ChatPromptTemplate.from_messages([

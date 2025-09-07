@@ -1,7 +1,6 @@
-from langgraph.graph.message import add_messages
 from typing_extensions import Annotated, TypedDict
-from typing import Literal, Sequence, List, Dict, Any
-from langchain_core.messages import BaseMessage, HumanMessage, RemoveMessage, AIMessage
+from typing import Sequence, List, Dict, Any
+from langchain_core.messages import BaseMessage
 import asyncio
 
 
@@ -22,3 +21,8 @@ class State(TypedDict):
     review_comments: List[ReviewComment]
     grouped_files: Dict[Dict, Any]
     messages: Sequence[BaseMessage]
+    diffs: List[Dict[str, Any]]
+    current_diff_index: int
+    additional_context: Dict[str, str]
+    pending_context_request: List[str]
+    context_round: int

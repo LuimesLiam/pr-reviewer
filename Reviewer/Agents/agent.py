@@ -1,9 +1,8 @@
 import asyncio
 import json
 import os
-import ast
-import re
-from typing import List
+import logging
+from typing import List, Dict, Any
 from langgraph.graph import START, END, StateGraph
 from langchain_core.messages import AIMessage, HumanMessage, BaseMessage
 from langgraph.types import Command
@@ -16,361 +15,393 @@ from Models.State import State, ReviewComment
 from Services.Git.git_factory import git_service_factory
 from Services.Git.AbstractGitService import AbstractGitService
 
+# --- Logging Setup ---
+logger = logging.getLogger(__name__)
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.DEBUG,
+                        format='[%(asctime)s] %(levelname)s %(name)s:%(lineno)d | %(message)s')
+
+
+def _truncate(val: Any, length: int = 500) -> str:
+    try:
+        s = str(val)
+    except Exception:
+        return '<unstringable>'
+    if len(s) <= length:
+        return s
+    return s[:length] + f"... <truncated {len(s)-length} chars>"
+
 
 class Reviewer:
 
     def __init__(self, model: BaseLLM):
         self.model = model
+        logger.debug("Initializing Reviewer with model=%s",
+                     type(model).__name__)
         self.git_service: AbstractGitService = git_service_factory("github")
+        logger.debug("Git service instantiated: %s",
+                     type(self.git_service).__name__)
         self.review_prompt = self._create_review_prompt()
+        self.context_request_prompt = self._create_context_request_prompt()
+        logger.debug("Prompts created (review_prompt vars=%s, context_prompt vars=%s)",
+                     self.review_prompt.input_variables, self.context_request_prompt.input_variables)
 
     def _create_review_prompt(self) -> ChatPromptTemplate:
+        logger.debug("Creating review prompt template")
+        # Curly braces for JSON examples are escaped with double braces so that
+        # ChatPromptTemplate only treats {instructions}, {diff_patch}, {context_files}
+        # as variables.
         template = """
-You are an expert code reviewer. You are reviewing a pull request.
-Return ONLY a single JSON object that matches the provided schema. Do NOT wrap it in markdown fences. Do NOT add explanations.
-Here are related file diffs that should be reviewed together:
+You are an expert code reviewer.
+You are reviewing ONE diff from a pull request.
+You ONLY see the patch for this file plus any additional context files provided.
+If you have ENOUGH information to provide feedback, return a JSON object per schema.
+If you do NOT have enough information (e.g. referenced functions/classes not shown or architectural context missing), instead return a JSON object requesting files.
 
-{file_group}
+Schema for feedback mode (mode = 'feedback'):
+{{
+  "mode": "feedback",
+  "file_name": string,
+  "review_comment": string,
+  "requires_rework": boolean,
+  "suggested_improvements_markdown": string
+}}
 
-Provide a JSON object with keys: file_name, review_comment, requires_rework, suggested_improvements_markdown.
+Schema for context request (mode = 'request_context'):
+{{
+  "mode": "request_context",
+  "file_name": string,               // current diff filename
+  "reason": string,                  // why more context is needed
+  "requested_files": [ string, ... ] // list of file paths to fetch next (limit 5)
+}}
+
+Return ONLY valid JSON. No markdown fences. No explanations outside JSON.
+
+Primary review instructions:
+{instructions}
+
+Current diff patch (unified format):
+```
+{diff_patch}
+```
+
+Additional context files provided:
+{context_files}
 """
         return ChatPromptTemplate.from_template(template)
 
-    async def get_grouped_files(self, state: State) -> Command:
-        """
-        Get the files from the pull request and group them.
-        """
-        q = state.get("event_queue")
-        repo_name = state.get("repo_name")
-        pr_number = state.get("pr_number")
+    def _create_context_request_prompt(self) -> ChatPromptTemplate:
+        logger.debug("Creating context request prompt template")
+        template = """
+Given the current file patch and previously supplied context files, decide if more context is still required. If yes, output request_context JSON (same schema). If no, output feedback JSON.
 
-        if q:
-            await q.put(f"▶️  Fetching files for {repo_name} #{pr_number}")
+Return ONLY JSON.
 
-        files = await self.git_service.group_files_in_pull_request(repo_name, pr_number)
+File: {file_name}
+Patch:
+```
+{diff_patch}
+```
+Context files:
+{context_files}
+"""
+        return ChatPromptTemplate.from_template(template)
 
-        num_files = len(files) if files else 0
-        if q:
-            await q.put(f"📂 Found {num_files} files in PR #{pr_number}")
-
-        messages = list(state.get("messages", []))
-        messages.append(AIMessage(content=f"Found {num_files} files."))
-
-        return Command(
-            update={
-                "grouped_files": files or {},
-                "messages": messages,
-            },
-            goto="review_files"
-        )
-
-    async def review_files(self, state: State) -> Command:
-        """
-        Review each group of files in the pull request together.
-        """
-        q = state.get("event_queue")
-        grouped_files = state.get("grouped_files", [])
-        review_comments: List[ReviewComment] = []
-        all_messages: List[BaseMessage] = list(state.get("messages", []))
-
-        # Define the expected schema for structured output
-        review_schema = {
-            "title": "FileReview",
-            "description": "Review output for a file or group of files in a pull request.",
-            "type": "object",
-            "properties": {
-                "file_name": {"type": "string", "description": "Name(s) of the file(s) reviewed."},
-                "review_comment": {"type": "string", "description": "Overall review comment for the file(s)."},
-                "requires_rework": {"type": "boolean", "description": "True if the file group requires rework."},
-                "suggested_improvements_markdown": {"type": "string", "description": "Markdown formatted suggestions for improvement."}
-            },
-            "required": ["file_name", "review_comment", "requires_rework", "suggested_improvements_markdown"]
-        }
-
-        def _coerce_review_dict(d: dict) -> ReviewComment:
-            # If model wrapped fields under an 'args' key (e.g. {"type":"FileReview","args":{...}}), unwrap it.
-            if 'args' in d and isinstance(d['args'], dict):
-                d = d['args']
-            return ReviewComment(
-                file_name=str(d.get("file_name", "unknown")),
-                review_comment=str(d.get("review_comment", "")),
-                requires_rework=bool(d.get("requires_rework", False)),
-                suggested_improvements_markdown=str(
-                    d.get("suggested_improvements_markdown", ""))
-            )
-
-        def _balanced_brace_extract(text: str, start_index: int) -> str | None:
-            depth = 0
-            start = None
-            for i in range(start_index, len(text)):
-                ch = text[i]
-                if ch == '{':
-                    if start is None:
-                        start = i
-                    depth += 1
-                elif ch == '}':
-                    if depth > 0:
-                        depth -= 1
-                        if depth == 0 and start is not None:
-                            return text[start:i+1]
-            return None
-
-        def _extract_args_section(raw: str) -> dict | None:
-            # Look for 'args': { ... }
-            for token in ["'args'", '"args"']:
-                idx = raw.find(token)
-                if idx != -1:
-                    brace_idx = raw.find('{', idx)
-                    if brace_idx != -1:
-                        snippet = _balanced_brace_extract(raw, brace_idx)
-                        if snippet:
-                            # Try JSON first
-                            try:
-                                return json.loads(snippet)
-                            except Exception:
-                                # Fallback to literal_eval
-                                try:
-                                    return ast.literal_eval(snippet)
-                                except Exception:
-                                    pass
-            return None
-
-        def _extract_first_object_with_keys(raw: str) -> dict | None:
-            # Find substring containing required keys and attempt extraction
-            required_keys = ["file_name", "review_comment",
-                             "requires_rework", "suggested_improvements_markdown"]
-            if all(k in raw for k in required_keys):
-                # Attempt to locate earliest '{' before first key
-                first_key_pos = min(raw.find(k)
-                                    for k in required_keys if raw.find(k) != -1)
-                prefix = raw.rfind('{', 0, first_key_pos)
-                if prefix != -1:
-                    snippet = _balanced_brace_extract(raw, prefix)
-                    if snippet:
-                        try:
-                            return json.loads(snippet)
-                        except Exception:
-                            try:
-                                return ast.literal_eval(snippet)
-                            except Exception:
-                                pass
-            return None
-
-        def _regex_key_extract(raw: str) -> dict:
-            # More permissive extraction of quoted string values, including multi-line until next key
-            result = {}
-            patterns = {
-                "file_name": r"file_name['\"]?\s*[:=]\s*['\"]([^'\"]*)['\"]",
-                "review_comment": r"review_comment['\"]?\s*[:=]\s*['\"]([^'\"]*)['\"]",
-                "requires_rework": r"requires_rework['\"]?\s*[:=]\s*(True|False|true|false|1|0)",
-                "suggested_improvements_markdown": r"suggested_improvements_markdown['\"]?\s*[:=]\s*['\"]([\s\S]*?)['\"]\s*(?:,|}\n|}\r|}$)"
-            }
-            for k, pat in patterns.items():
-                m = re.search(pat, raw)
-                if m:
-                    val = m.group(1)
-                    if k == "requires_rework":
-                        result[k] = val.lower() in ("true", "1")
-                    else:
-                        result[k] = val
-            return result
-
-        def _parse_response(resp) -> List[ReviewComment]:
-            parsed: List[ReviewComment] = []
-            # Direct types
-            if isinstance(resp, dict):
-                parsed.append(_coerce_review_dict(resp))
-                return parsed
-            if isinstance(resp, list):
-                for item in resp:
-                    if isinstance(item, dict):
-                        parsed.append(_coerce_review_dict(item))
-                if parsed:
-                    return parsed
-            # Extract content
-            content = getattr(resp, "content", resp)
-            if not isinstance(content, str):
-                return parsed
-            raw = content.strip()
-            # Try full JSON
-            try:
-                loaded = json.loads(raw)
-                return _parse_response(loaded)
-            except Exception:
-                pass
-            # args section
-            args_dict = _extract_args_section(raw)
-            if args_dict and all(k in args_dict for k in ["file_name", "review_comment", "requires_rework", "suggested_improvements_markdown"]):
-                return [_coerce_review_dict(args_dict)]
-            # Attempt first object with keys
-            obj_with_keys = _extract_first_object_with_keys(raw)
-            if obj_with_keys:
-                return [_coerce_review_dict(obj_with_keys)]
-            # Extract JSON-like portion
-            try:
-                first_brace = raw.index('{')
-                last_brace = raw.rindex('}')
-                candidate = raw[first_brace:last_brace+1]
-                try:
-                    loaded = json.loads(candidate)
-                    return _parse_response(loaded)
-                except Exception:
-                    try:
-                        loaded = ast.literal_eval(candidate)
-                        return _parse_response(loaded)
-                    except Exception:
-                        pass
-            except ValueError:
-                pass
-            # Regex fallback
-            fallback = _regex_key_extract(raw)
-            if fallback:
-                parsed.append(_coerce_review_dict(fallback))
-            return parsed
-
-        # Read instructions from files
+    async def load_instructions(self) -> str:
+        logger.debug("Loading instructions")
         instructions_dir = os.path.join(
             os.path.dirname(__file__), "Instructions")
-        python_instructions = ""
-        dotnet_instructions = ""
-        general_instructions = ""
+        parts = []
+        for fname in ["general.txt", "PythonSet.txt", "dotnetSet.txt"]:
+            path = os.path.join(instructions_dir, fname)
+            if os.path.exists(path):
+                try:
+                    with open(path, "r") as f:
+                        content = f.read().strip()
+                        parts.append(content)
+                        logger.debug(
+                            "Loaded instruction file %s (%d chars)", fname, len(content))
+                except Exception as e:
+                    logger.warning(
+                        "Failed reading instruction file %s: %s", fname, e)
+            else:
+                logger.debug("Instruction file missing: %s", fname)
+        result = "\n\n".join(parts)
+        logger.debug("Aggregated instructions length=%d", len(result))
+        return result
+
+    async def fetch_diffs(self, state: State) -> Command:
+        logger.debug("fetch_diffs called with state keys=%s",
+                     list(state.keys()))
+        q = state.get("event_queue")
+        repo = state.get("repo_name")
+        pr = state.get("pr_number")
+        logger.info("Fetching diffs for repo=%s pr=%s", repo, pr)
+        if q:
+            await q.put(f"▶️ Fetching diffs for {repo} PR #{pr}")
+        pr_data = await self.git_service.get_pull_request(repo, pr)
+        logger.debug("PR data type=%s keys=%s", type(pr_data).__name__, list(
+            pr_data.keys()) if isinstance(pr_data, dict) else 'n/a')
+        diffs = pr_data.get("diffs", []) if isinstance(pr_data, dict) else []
+        logger.info("Fetched %d diffs", len(diffs))
+        if q:
+            await q.put(f"📂 {len(diffs)} diffs fetched")
+        messages = list(state.get("messages", []))
+        messages.append(AIMessage(content=f"Loaded {len(diffs)} diffs"))
+        return Command(update={
+            "diffs": diffs,
+            "current_diff_index": 0,
+            "additional_context": {},
+            "pending_context_request": [],
+            "context_round": 0,
+            "messages": messages
+        }, goto="review_single_diff")
+
+    async def _build_context_section(self, additional_context: Dict[str, str]) -> str:
+        logger.debug("Building context section for %d files",
+                     len(additional_context))
+        if not additional_context:
+            return "(none)"
+        sections = []
+        for path, content in additional_context.items():
+            snippet = content[:1500]  # truncate to control prompt size
+            logger.debug("Context file included path=%s size=%d truncated_to=%d", path, len(
+                content), len(snippet))
+            sections.append(f"--- {path} ---\n{snippet}")
+        joined = "\n\n".join(sections)
+        logger.debug("Context section total length=%d", len(joined))
+        return joined
+
+    def _parse_model_json(self, raw_content: Any) -> Dict[str, Any] | None:
+        logger.debug("Parsing model JSON from type=%s",
+                     type(raw_content).__name__)
+        if isinstance(raw_content, dict):
+            logger.debug("Raw content already dict with keys=%s",
+                         list(raw_content.keys()))
+            return raw_content
+        text = getattr(raw_content, "content", raw_content)
+        if not isinstance(text, str):
+            logger.warning("Model output not string-like: %s", type(text))
+            return None
+        text = text.strip()
+        logger.debug("Model raw text length=%d preview=%s",
+                     len(text), _truncate(text, 120))
+        # Try direct JSON
         try:
-            with open(os.path.join(instructions_dir, "PythonSet.txt"), "r") as f:
-                python_instructions = f.read().strip()
-        except Exception:
-            pass
+            parsed = json.loads(text)
+            logger.debug("Parsed JSON directly with keys=%s",
+                         list(parsed.keys()))
+            return parsed
+        except Exception as e:
+            logger.debug("Direct JSON parse failed: %s", e)
+        # Try to locate first JSON object by braces
         try:
-            with open(os.path.join(instructions_dir, "dotnetSet.txt"), "r") as f:
-                dotnet_instructions = f.read().strip()
-        except Exception:
-            pass
+            first = text.index('{')
+            last = text.rindex('}')
+            candidate = text[first:last+1]
+            parsed = json.loads(candidate)
+            logger.debug("Parsed JSON via slicing with keys=%s",
+                         list(parsed.keys()))
+            return parsed
+        except Exception as e:
+            logger.warning("Failed to parse model output as JSON: %s", e)
+            return None
+
+    async def review_single_diff(self, state: State) -> Command:
+        logger.debug("review_single_diff invoked")
+        q = state.get("event_queue")
+        idx = state.get("current_diff_index", 0)
+        diffs = state.get("diffs", [])
+        logger.debug("Current diff index=%d total_diffs=%d", idx, len(diffs))
+        if idx >= len(diffs):
+            logger.info("All diffs processed; moving to completion")
+            return Command(goto="complete_review", update={})
+        diff_obj = diffs[idx] if isinstance(diffs, list) else {}
+        file_name = str(diff_obj.get("filename", "unknown"))
+        patch = diff_obj.get("patch") or "(no patch available)"
+        logger.info("Reviewing diff index=%d file=%s patch_len=%d",
+                    idx, file_name, len(patch))
+        additional_context = state.get("additional_context", {})
+        instructions = await self.load_instructions()
+        context_section = await self._build_context_section(additional_context)
+        logger.debug("Invoking model for file=%s context_files=%d instructions_len=%d",
+                     file_name, len(additional_context), len(instructions))
         try:
-            with open(os.path.join(instructions_dir, "general.txt"), "r") as f:
-                general_instructions = f.read().strip()
-        except Exception:
-            pass
-
-        for group in grouped_files:
-            if q:
-                await q.put(f"🔍 Reviewing a group of {len(group)} files...")
-
-            # Determine which instructions to include
-            include_python = any(file_info.get(
-                "file_path", "").endswith(".py") for file_info in group)
-            include_dotnet = any(file_info.get(
-                "file_path", "").endswith(".cs") for file_info in group)
-
-            instructions = []
-            if general_instructions:
-                instructions.append(general_instructions)
-            if include_python and python_instructions:
-                instructions.append(python_instructions)
-            if include_dotnet and dotnet_instructions:
-                instructions.append(dotnet_instructions)
-            # Add explicit JSON-only directive
-            instructions.append(
-                "Return ONLY valid JSON. No markdown, no commentary.")
-            instructions_str = "\n\n".join(instructions)
-
-            # Preprocess and combine file diffs
-            file_entries = []
-            for file_info in group:
-                file_name = file_info.get("file_path")
-                old_diff = file_info.get("old_diff", "") or ""
-                new_diff = file_info.get("new_diff", "") or ""
-                entry = f"file: {file_name}\nold diff:\n{old_diff}\nnew diff:\n{new_diff}"
-                file_entries.append(entry)
-            combined_diff = "\n\n".join(file_entries)
-
-            # Format prompt with combined diffs and instructions
-            prompt_str = self.review_prompt.format(file_group=combined_diff)
-            if instructions_str:
-                prompt_str = f"Instructions for this review:\n{instructions_str}\n\n" + prompt_str
-            prompt = ChatPromptTemplate.from_messages(
-                [HumanMessage(content=prompt_str)])
-
-            # Use structured output invocation
-            response = await self.model._invoke_structured_output(
-                prompt=prompt,
-                schema=review_schema
+            response = await self.model._invoke(
+                self.review_prompt,
+                instructions=instructions,
+                diff_patch=patch,
+                context_files=context_section
             )
-
-            try:
-                parsed_comments = _parse_response(response)
-                if not parsed_comments:
-                    raise ValueError(
-                        "Unable to parse model response into review comments")
-                for rc in parsed_comments:
-                    review_comments.append(rc)
-                    all_messages.append(AIMessage(content=json.dumps(rc)))
-                if q:
-                    await q.put(f"✅ Finished reviewing group of files")
-            except Exception as e:
-                if q:
-                    await q.put(f"❌ Error reviewing group of files: {e}")
-                all_messages.append(
-                    AIMessage(
-                        content=f"Error processing review for file group: {e}")
-                )
-
-        return Command(
-            update={
-                "review_comments": review_comments,
-                "messages": all_messages
-            },
-            goto="complete_review"
+            logger.debug("Model response type=%s", type(response).__name__)
+        except Exception as e:
+            logger.exception(
+                "Model invocation error for file=%s: %s", file_name, e)
+            # Wrap error so downstream parse logic still works
+            response = AIMessage(
+                content=f"{{\"mode\": \"feedback\", \"file_name\": \"{file_name}\", \"review_comment\": \"Model invocation error: {str(e).replace('\\\"', '\\\"')}\", \"requires_rework\": false, \"suggested_improvements_markdown\": \"\"}}")
+        parsed = self._parse_model_json(response)
+        if not parsed:
+            if q:
+                await q.put(f"⚠️ Model returned unparseable output for {file_name}; skipping")
+            logger.warning(
+                "Unparseable model output for file=%s; skipping to next diff", file_name)
+            messages = list(state.get("messages", []))
+            messages.append(
+                AIMessage(content=f"Could not parse review for {file_name}"))
+            return Command(update={
+                "current_diff_index": idx + 1,
+                "additional_context": {},
+                "pending_context_request": [],
+                "context_round": 0,
+                "messages": messages
+            }, goto="review_single_diff")
+        mode = parsed.get("mode")
+        logger.debug("Parsed model mode=%s keys=%s", mode, list(parsed.keys()))
+        messages = list(state.get("messages", []))
+        if mode == "request_context":
+            requested = [str(r) for r in parsed.get("requested_files", [])][:5]
+            reason = parsed.get("reason", "")
+            logger.info("Model requested context for file=%s files=%s reason=%s",
+                        file_name, requested, _truncate(reason, 200))
+            if q:
+                await q.put(f"📄 Context requested for {file_name}: {requested} ({reason})")
+            messages.append(
+                AIMessage(content=f"Context requested for {file_name}: {requested}"))
+            return Command(update={
+                "pending_context_request": requested,
+                "context_round": state.get("context_round", 0) + 1,
+                "messages": messages
+            }, goto="fetch_additional_context")
+        review_comment: ReviewComment = ReviewComment(
+            file_name=file_name,
+            review_comment=str(parsed.get("review_comment", "")),
+            requires_rework=bool(parsed.get("requires_rework", False)),
+            suggested_improvements_markdown=str(
+                parsed.get("suggested_improvements_markdown", ""))
         )
+        # Adjust for TypedDict indexing when logging
+        logger.info(
+            "Completed review for file=%s requires_rework=%s comment_len=%d improvements_len=%d",
+            file_name,
+            review_comment["requires_rework"],
+            len(review_comment["review_comment"]),
+            len(review_comment["suggested_improvements_markdown"])
+        )
+        existing = list(state.get("review_comments", []))
+        existing.append(review_comment)
+        if q:
+            await q.put(f"✅ Review completed for {file_name}")
+        messages.append(AIMessage(content=json.dumps(review_comment)))
+        return Command(update={
+            "review_comments": existing,
+            "current_diff_index": idx + 1,
+            "additional_context": {},
+            "pending_context_request": [],
+            "context_round": 0,
+            "messages": messages
+        }, goto="review_single_diff")
+
+    async def fetch_additional_context(self, state: State) -> Command:
+        logger.debug("fetch_additional_context invoked")
+        q = state.get("event_queue")
+        repo = state.get("repo_name")
+        pr = state.get("pr_number")
+        pending = state.get("pending_context_request", [])
+        logger.info(
+            "Fetching additional context repo=%s pr=%s pending_files=%s", repo, pr, pending)
+        additional_context = dict(state.get("additional_context", {}))
+        fetched = []
+        for path in pending:
+            if path in additional_context:
+                logger.debug("Skipping already-fetched context file=%s", path)
+                continue
+            try:
+                file_content = await self.git_service.get_file_from_pull_request(repo, pr, path)
+                if isinstance(file_content, dict):
+                    additional_context[path] = file_content.get(
+                        "decoded_content", "")
+                    fetched.append(path)
+                    logger.debug("Fetched file=%s size=%d", path,
+                                 len(additional_context[path]))
+                else:
+                    logger.warning("Unexpected file content type for %s: %s", path, type(
+                        file_content).__name__)
+            except Exception as e:
+                logger.warning(
+                    "Failed to fetch requested file=%s error=%s", path, e)
+                if q:
+                    await q.put(f"⚠️ Unable to fetch requested file: {path}")
+        if q and fetched:
+            await q.put(f"📥 Fetched additional context files: {fetched}")
+        messages = list(state.get("messages", []))
+        if fetched:
+            messages.append(AIMessage(content=f"Fetched context: {fetched}"))
+        logger.info("Additional context fetch complete fetched=%s", fetched)
+        return Command(update={
+            "additional_context": additional_context,
+            "pending_context_request": [],
+            "messages": messages
+        }, goto="review_single_diff")
 
     async def complete_review(self, state: State) -> Command:
-        """
-        Complete the review process and return all review comments.
-        """
+        logger.info("Completing review process")
         q = state.get("event_queue")
         if q:
-            # Send all review comments as a JSON string to the event stream
             await q.put("__COMPLETE__")
-
         messages = list(state.get("messages", []))
         messages.append(AIMessage(content="Review completed successfully."))
-
-        # Return all review comments in the final update
-        return Command(
-            update={
-                "messages": messages
-            },
-            goto=END
-        )
+        logger.debug("Total review comments=%d", len(
+            state.get("review_comments", [])))
+        return Command(update={"messages": messages}, goto=END)
 
 
 class ReviewerHandler:
     async def async_init(self):
+        logger.debug("ReviewerHandler.async_init start")
         self.model = llm_factory("gemini")
+        logger.debug("Model instantiated: %s", type(self.model).__name__)
         self.reviewerModel = Reviewer(model=self.model)
 
         graph_builder = StateGraph(state_schema=State)
+        logger.debug("StateGraph initialized with schema=%s", State)
 
-        graph_builder.add_node("get_grouped_files",
-                               self.reviewerModel.get_grouped_files)
-        graph_builder.add_node("review_files", self.reviewerModel.review_files)
+        # Nodes
+        graph_builder.add_node("fetch_diffs", self.reviewerModel.fetch_diffs)
+        graph_builder.add_node("review_single_diff",
+                               self.reviewerModel.review_single_diff)
+        graph_builder.add_node("fetch_additional_context",
+                               self.reviewerModel.fetch_additional_context)
         graph_builder.add_node(
             "complete_review", self.reviewerModel.complete_review)
+        logger.debug("Graph nodes added")
 
-        graph_builder.add_edge(START, "get_grouped_files")
-        graph_builder.add_edge("get_grouped_files", "review_files")
-        graph_builder.add_edge("review_files", "complete_review")
-        graph_builder.add_edge("complete_review", END)
+        # Only the initial edge; subsequent transitions are controlled via Command.goto
+        graph_builder.add_edge(START, "fetch_diffs")
+        logger.debug("Initial edge added START->fetch_diffs")
 
         self.reviewer_graph = graph_builder.compile()
+        logger.debug("Graph compiled")
 
     async def run(self, repo_name: str, pr_number: int, event_queue: asyncio.Queue[str]):
+        logger.info("ReviewerHandler.run invoked repo=%s pr=%s",
+                    repo_name, pr_number)
         initial_state = State(
             repo_name=repo_name,
             pr_number=pr_number,
             event_queue=event_queue,
             review_comments=[],
-            grouped_files={},
+            grouped_files={},  # legacy
             messages=[HumanMessage(
-                content=f"Review PR #{pr_number} for {repo_name}")]
+                content=f"Review PR #{pr_number} for {repo_name}")],
+            diffs=[],
+            current_diff_index=0,
+            additional_context={},
+            pending_context_request=[],
+            context_round=0,
         )
-
-        return await self.reviewer_graph.ainvoke(input=initial_state)
+        logger.debug("Initial state prepared keys=%s",
+                     list(initial_state.keys()))
+        result = await self.reviewer_graph.ainvoke(input=initial_state)
+        logger.info("Reviewer graph execution complete")
+        return result
