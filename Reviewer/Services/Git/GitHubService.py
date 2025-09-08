@@ -3,6 +3,7 @@ import os
 import ast
 import asyncio
 import networkx as nx
+import difflib
 
 from github import Github
 from dotenv import load_dotenv
@@ -56,10 +57,22 @@ class GitHubService(AbstractGitService):
         }
 
     async def get_file_from_pull_request(self, repo_name: str, pr_number: int, file_path: str):
+        """Fetch a file as it exists on the PR head branch.
+        If the exact path lookup fails, attempt fuzzy matching among changed files."""
         repo = await self.get_repo(repo_name)
         pr = await asyncio.to_thread(repo.get_pull, pr_number)
         branch = pr.head.ref
-        return await self.get_file(repo_name, file_path, branch=branch)
+        try:
+            return await self.get_file(repo_name, file_path, branch=branch)
+        except Exception:
+            # attempt fuzzy resolution
+            candidates = await self.find_file_in_pr(repo_name, pr_number, file_path)
+            for cand in candidates:
+                try:
+                    return await self.get_file(repo_name, cand, branch=branch)
+                except Exception:
+                    continue
+            raise
 
     async def get_all_files_from_pull_request(self, repo_name: str, pr_number: int):
         repo = await self.get_repo(repo_name)
@@ -125,6 +138,52 @@ class GitHubService(AbstractGitService):
             grouped_info.append(group_entries)
 
         return grouped_info
+
+    async def get_pr_changed_file_paths(self, repo_name: str, pr_number: int) -> list[str]:
+        repo = await self.get_repo(repo_name)
+        pr = await asyncio.to_thread(repo.get_pull, pr_number)
+        files = await asyncio.to_thread(lambda: list(pr.get_files()))
+        return [f.filename for f in files]
+
+    async def find_file_in_pr(self, repo_name: str, pr_number: int, target: str) -> list[str]:
+        """Return candidate matches for a requested file path within the PR.
+        Strategy:
+          1. Exact match among changed files
+          2. Suffix match (filename portion)
+          3. Substring match
+          4. Fuzzy ratio >= 0.6 among changed files
+        Returns ordered list of candidates (best first)."""
+        changed = await self.get_pr_changed_file_paths(repo_name, pr_number)
+        if not target:
+            return []
+        target_norm = target.strip().lstrip('./')
+        if target_norm in changed:
+            return [target_norm]
+        # filename only
+        candidates = []
+        target_file = os.path.basename(target_norm)
+        suffix_matches = [
+            p for p in changed if os.path.basename(p) == target_file]
+        candidates.extend(suffix_matches)
+        if not suffix_matches:
+            # substring
+            sub = [p for p in changed if target_file in p]
+            candidates.extend(sub)
+        # fuzzy
+        ratios = [(difflib.SequenceMatcher(a=target_file,
+                   b=os.path.basename(p)).ratio(), p) for p in changed]
+        ratios.sort(reverse=True)
+        for r, p in ratios:
+            if r >= 0.6 and p not in candidates:
+                candidates.append(p)
+        # de-dup preserving order
+        seen = set()
+        ordered = []
+        for p in candidates:
+            if p not in seen:
+                ordered.append(p)
+                seen.add(p)
+        return ordered
 
     @staticmethod
     def _group_related_files(file_contents: dict):

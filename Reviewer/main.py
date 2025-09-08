@@ -18,6 +18,8 @@ origins = [
     "*"
 ]
 
+HEARTBEAT_INTERVAL_SECONDS = 25
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -124,29 +126,12 @@ class MessageBody(BaseModel):
     repo_name: str
 
 
-# @app.post("/review")
-# @cancellable
-# async def process_review(body: MessageBody, request: Request):
-#     """
-#     Process the review request with the Gemini model.
-#     """
-#     message = body.content
-
-#     try:
-#         output = await agent_handler.run(input=message)
-#         return output
-#     except Exception as e:
-#         print(f"Error processing review: {e}")
-#         raise HTTPException(status_code=500, detail=str(e))
-
-
 # --- inside /review/stream ----------------------------------------------------
 @app.post("/review/stream")
 async def process_review_stream(body: MessageBody, request: Request):
     queue: asyncio.Queue[str] = asyncio.Queue()
 
     async def event_generator():
-        # Kick off the run **but don’t await it yet**
         run_task = asyncio.create_task(
             agent_handler.run(
                 repo_name=body.repo_name,
@@ -154,38 +139,88 @@ async def process_review_stream(body: MessageBody, request: Request):
                 event_queue=queue,
             )
         )
+        completed = False  # tracks whether we already sent a completion frame
+        try:
+            while True:
+                # Wait for next queue item with heartbeat timeout
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_INTERVAL_SECONDS)
+                    queue.task_done()
+                except asyncio.TimeoutError:
+                    # Heartbeat
+                    yield "data: {\"type\":\"heartbeat\"}\n\n"
+                    # If the background task is finished (success or error) and there are no more messages, finalize.
+                    if run_task.done() and queue.empty() and not completed:
+                        completed = True
+                        try:
+                            result = await run_task
+                            # Normal path if graph finished without sending __COMPLETE__ (e.g. crash before completion node)
+                            if isinstance(result, dict):
+                                rc = result.get("review_comments", [])
+                            else:
+                                rc = []
+                            payload = {"type": "complete",
+                                       "review_comments": rc, "forced": True}
+                            yield f"data: {json.dumps(payload)}\n\n"
+                        except Exception as e:
+                            err_payload = {
+                                "type": "error", "message": f"Background task failed: {str(e)}"}
+                            yield f"data: {json.dumps(err_payload)}\n\n"
+                        break
+                    continue
 
-        # Stream incremental messages
-        while True:
-            msg = await queue.get()
+                # Handle queue message
+                if msg == "__COMPLETE__":
+                    # Normal completion path
+                    try:
+                        result = await run_task
+                        if type(result) is State:
+                            final_state: State = result
+                        elif isinstance(result, dict):
+                            final_state: State = State(**result)
+                        else:
+                            raise HTTPException(
+                                status_code=500, detail="Invalid State result type")
+                        payload = {
+                            "type": "complete",
+                            "review_comments": final_state["review_comments"],
+                        }
+                        yield f"data: {json.dumps(payload)}\n\n"
+                    except Exception as e:
+                        err_payload = {"type": "error",
+                                       "message": f"Completion error: {str(e)}"}
+                        yield f"data: {json.dumps(err_payload)}\n\n"
+                    completed = True
+                    break
 
-            if msg == "__COMPLETE__":
-                # 1️⃣  Graph is finished – wait for the real return value
-                result = await run_task
-                if type(result) is State:
-                    final_state: State = result
-                elif isinstance(result, dict):
-                    final_state: State = State(**result)
-                else:
-                    raise HTTPException(
-                        status_code=500, detail="Invalid State result type")
+                # Normal progress messages
+                try:
+                    data = json.loads(msg)
+                    yield f"data: {json.dumps(data)}\n\n"
+                except Exception:
+                    yield f"data: {msg}\n\n"
 
-                # 2️⃣  Build whatever payload the UI needs
-                payload = {
-                    "type": "complete",
-                    "review_comments": final_state["review_comments"],
-                    # add anything else you need from State here
-                }
-
-                # 3️⃣  Send the final payload, then break the loop
-                yield f"data: {json.dumps(payload)}\n\n"
-                break
-
-            # ---------- normal progress messages ----------
-            try:
-                data = json.loads(msg)
-                yield f"data: {json.dumps(data)}\n\n"
-            except Exception:
-                yield f"data: {msg}\n\n"
+                # If background task has ended (unexpectedly) and no formal completion was sent, force completion
+                if run_task.done() and not completed and queue.empty():
+                    try:
+                        result = await run_task
+                        if isinstance(result, dict):
+                            rc = result.get("review_comments", [])
+                        else:
+                            rc = []
+                        payload = {"type": "complete",
+                                   "review_comments": rc, "forced": True}
+                        yield f"data: {json.dumps(payload)}\n\n"
+                    except Exception as e:
+                        err_payload = {
+                            "type": "error", "message": f"Background task failed: {str(e)}"}
+                        yield f"data: {json.dumps(err_payload)}\n\n"
+                    completed = True
+                    break
+        finally:
+            if not run_task.done():
+                run_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await run_task
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")

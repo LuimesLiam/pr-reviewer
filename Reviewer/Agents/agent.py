@@ -21,6 +21,14 @@ if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.DEBUG,
                         format='[%(asctime)s] %(levelname)s %(name)s:%(lineno)d | %(message)s')
 
+# --- Configuration (env overridable) ---
+MODEL_REVIEW_TIMEOUT_SECONDS = int(
+    os.getenv("MODEL_REVIEW_TIMEOUT_SECONDS", "180"))
+MAX_PATCH_CHARS = int(os.getenv("MAX_PATCH_CHARS", "20000"))
+MAX_CONTEXT_ROUNDS = int(os.getenv("MAX_CONTEXT_ROUNDS", "3"))
+GRAPH_RECURSION_LIMIT = min(
+    int(os.getenv("GRAPH_RECURSION_LIMIT", "300")), 2000)
+
 
 def _truncate(val: Any, length: int = 500) -> str:
     try:
@@ -219,27 +227,64 @@ Context files:
         diff_obj = diffs[idx] if isinstance(diffs, list) else {}
         file_name = str(diff_obj.get("filename", "unknown"))
         patch = diff_obj.get("patch") or "(no patch available)"
-        logger.info("Reviewing diff index=%d file=%s patch_len=%d",
-                    idx, file_name, len(patch))
+        if q:
+            try:
+                await q.put(f"🔍 Reviewing {idx+1}/{len(diffs)}: {file_name}")
+            except Exception:  # safety
+                pass
+        patch_for_model = patch
+        if len(patch_for_model) > MAX_PATCH_CHARS:
+            truncated_len = len(patch_for_model) - MAX_PATCH_CHARS
+            patch_for_model = patch_for_model[:MAX_PATCH_CHARS] + \
+                f"\n... <truncated {truncated_len} chars>"
+            if q:
+                await q.put(f"⚠️ Patch truncated for {file_name} (original {len(patch)} chars, truncated {truncated_len} chars)")
+        logger.info("Reviewing diff index=%d file=%s patch_len=%d used_len=%d",
+                    idx, file_name, len(patch), len(patch_for_model))
         additional_context = state.get("additional_context", {})
         instructions = await self.load_instructions()
         context_section = await self._build_context_section(additional_context)
-        logger.debug("Invoking model for file=%s context_files=%d instructions_len=%d",
-                     file_name, len(additional_context), len(instructions))
+        logger.debug("Invoking model for file=%s context_files=%d instructions_len=%d timeout=%ds",
+                     file_name, len(additional_context), len(instructions), MODEL_REVIEW_TIMEOUT_SECONDS)
         try:
-            response = await self.model._invoke(
-                self.review_prompt,
-                instructions=instructions,
-                diff_patch=patch,
-                context_files=context_section
+            response = await asyncio.wait_for(
+                self.model._invoke(
+                    self.review_prompt,
+                    instructions=instructions,
+                    diff_patch=patch_for_model,
+                    context_files=context_section
+                ),
+                timeout=MODEL_REVIEW_TIMEOUT_SECONDS
             )
             logger.debug("Model response type=%s", type(response).__name__)
+        except asyncio.TimeoutError:
+            logger.warning("Model timeout after %ds for file=%s; skipping with fallback review",
+                           MODEL_REVIEW_TIMEOUT_SECONDS, file_name)
+            if q:
+                await q.put(f"⏱️ Model timeout for {file_name}; skipping with fallback review")
+            fallback_comment: ReviewComment = ReviewComment(
+                file_name=file_name,
+                review_comment=f"Model timed out after {MODEL_REVIEW_TIMEOUT_SECONDS}s while reviewing this diff. Consider manually inspecting this file.",
+                requires_rework=False,
+                suggested_improvements_markdown=""
+            )
+            existing = list(state.get("review_comments", []))
+            existing.append(fallback_comment)
+            messages = list(state.get("messages", []))
+            messages.append(AIMessage(content=json.dumps(fallback_comment)))
+            return Command(update={
+                "review_comments": existing,
+                "current_diff_index": idx + 1,
+                "additional_context": {},
+                "pending_context_request": [],
+                "context_round": 0,
+                "messages": messages
+            }, goto="review_single_diff")
         except Exception as e:
             logger.exception(
                 "Model invocation error for file=%s: %s", file_name, e)
-            # Wrap error so downstream parse logic still works
             response = AIMessage(
-                content=f"{{\"mode\": \"feedback\", \"file_name\": \"{file_name}\", \"review_comment\": \"Model invocation error: {str(e).replace('\\\"', '\\\"')}\", \"requires_rework\": false, \"suggested_improvements_markdown\": \"\"}}")
+                content=f"{{\"mode\": \"feedback\", \"file_name\": \"{file_name}\", \"review_comment\": \"Model invocation error: {str(e).replace('\\"', '\\\"')}\", \"requires_rework\": false, \"suggested_improvements_markdown\": \"\"}}")
         parsed = self._parse_model_json(response)
         if not parsed:
             if q:
@@ -259,6 +304,21 @@ Context files:
         mode = parsed.get("mode")
         logger.debug("Parsed model mode=%s keys=%s", mode, list(parsed.keys()))
         messages = list(state.get("messages", []))
+        # Enforce context round limit
+        current_context_round = state.get("context_round", 0)
+        if mode == "request_context" and current_context_round >= MAX_CONTEXT_ROUNDS:
+            logger.info("Context round limit reached for file=%s (round=%d >= %d); forcing feedback fallback",
+                        file_name, current_context_round, MAX_CONTEXT_ROUNDS)
+            if q:
+                await q.put(f"⚠️ Context round limit reached for {file_name}; proceeding with partial review")
+            parsed = {
+                "mode": "feedback",
+                "file_name": file_name,
+                "review_comment": (parsed.get("reason") or "Context limit reached; partial review provided with available information."),
+                "requires_rework": False,
+                "suggested_improvements_markdown": ""
+            }
+            mode = "feedback"
         if mode == "request_context":
             requested = [str(r) for r in parsed.get("requested_files", [])][:5]
             reason = parsed.get("reason", "")
@@ -270,7 +330,7 @@ Context files:
                 AIMessage(content=f"Context requested for {file_name}: {requested}"))
             return Command(update={
                 "pending_context_request": requested,
-                "context_round": state.get("context_round", 0) + 1,
+                "context_round": current_context_round + 1,
                 "messages": messages
             }, goto="fetch_additional_context")
         review_comment: ReviewComment = ReviewComment(
@@ -280,14 +340,8 @@ Context files:
             suggested_improvements_markdown=str(
                 parsed.get("suggested_improvements_markdown", ""))
         )
-        # Adjust for TypedDict indexing when logging
         logger.info(
-            "Completed review for file=%s requires_rework=%s comment_len=%d improvements_len=%d",
-            file_name,
-            review_comment["requires_rework"],
-            len(review_comment["review_comment"]),
-            len(review_comment["suggested_improvements_markdown"])
-        )
+            "Completed review for file=%s requires_rework=%s comment_len=%d improvements_len=%d", file_name, review_comment["requires_rework"], len(review_comment["review_comment"]), len(review_comment["suggested_improvements_markdown"]))
         existing = list(state.get("review_comments", []))
         existing.append(review_comment)
         if q:
@@ -330,8 +384,31 @@ Context files:
             except Exception as e:
                 logger.warning(
                     "Failed to fetch requested file=%s error=%s", path, e)
-                if q:
-                    await q.put(f"⚠️ Unable to fetch requested file: {path}")
+                # Try fuzzy find candidates
+                try:
+                    candidates = await self.git_service.find_file_in_pr(repo, pr, path)
+                except Exception:
+                    candidates = []
+                if candidates:
+                    resolved = None
+                    for cand in candidates:
+                        try:
+                            file_content = await self.git_service.get_file_from_pull_request(repo, pr, cand)
+                            if isinstance(file_content, dict):
+                                additional_context[cand] = file_content.get(
+                                    "decoded_content", "")
+                                fetched.append(cand)
+                                resolved = cand
+                                logger.debug(
+                                    "Fuzzy-resolved %s -> %s", path, cand)
+                                break
+                        except Exception:
+                            continue
+                    if resolved is None and q:
+                        await q.put(f"⚠️ Unable to fetch requested file: {path}")
+                else:
+                    if q:
+                        await q.put(f"⚠️ Unable to fetch requested file: {path}")
         if q and fetched:
             await q.put(f"📥 Fetched additional context files: {fetched}")
         messages = list(state.get("messages", []))
@@ -347,10 +424,21 @@ Context files:
     async def complete_review(self, state: State) -> Command:
         logger.info("Completing review process")
         q = state.get("event_queue")
+        summary_lines = []
+        for rc in state.get("review_comments", []):
+            summary_lines.append(
+                f"- {rc['file_name']}: {'REWORK' if rc['requires_rework'] else 'OK'}")
+        if not summary_lines:
+            summary_lines.append("(No review comments generated)")
+        summary_text = "Review Summary:\n" + "\n".join(summary_lines)
         if q:
-            await q.put("__COMPLETE__")
+            try:
+                await q.put(summary_text)
+                await q.put("__COMPLETE__")
+            except Exception:
+                logger.warning("Failed pushing completion events to queue")
         messages = list(state.get("messages", []))
-        messages.append(AIMessage(content="Review completed successfully."))
+        messages.append(AIMessage(content=summary_text))
         logger.debug("Total review comments=%d", len(
             state.get("review_comments", [])))
         return Command(update={"messages": messages}, goto=END)
@@ -402,6 +490,18 @@ class ReviewerHandler:
         )
         logger.debug("Initial state prepared keys=%s",
                      list(initial_state.keys()))
-        result = await self.reviewer_graph.ainvoke(input=initial_state)
+        logger.debug(
+            "Invoking reviewer_graph with recursion_limit=%d", GRAPH_RECURSION_LIMIT)
+        result = await self.reviewer_graph.ainvoke(input=initial_state, config={"recursion_limit": GRAPH_RECURSION_LIMIT})
         logger.info("Reviewer graph execution complete")
+        # Attempt to push final structured review comments
+        if event_queue:
+            try:
+                final_comments = result.get(
+                    "review_comments", []) if isinstance(result, dict) else []
+                if final_comments:
+                    await event_queue.put(json.dumps({"review_comments": final_comments}))
+            except Exception as e:
+                logging.debug(
+                    "Could not push final review comments JSON: %s", e)
         return result
