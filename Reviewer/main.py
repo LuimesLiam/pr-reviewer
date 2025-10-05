@@ -230,35 +230,30 @@ async def process_review_stream(body: MessageBody, request: Request):
 
 @app.post("/review/test")
 async def test():
-    """Example usage of the reviewer workflow."""
+    """Example usage of the reviewer workflow, streaming events as they occur."""
     handler = ReviewerHandlerAgent()
 
-    # Example: Review a PR
-    result = await handler.run(
-        repo_name="LuimesLiam/HomeApp",  # Replace with actual repo
-        pr_number=1  # Replace with actual PR number
-    )
+    async def event_generator():
+        async for event in await handler.run(
+            repo_name="LuimesLiam/HomeApp",  # Replace with actual repo
+            pr_number=1  # Replace with actual PR number
+        ):
+            # You may want to format the event as JSON or string, depending on your event type
+            import json
+            try:
+                yield f"data: {json.dumps(event)}\n\n"
+            except Exception:
+                yield f"data: {str(event)}\n\n"
 
-    if result and result.summary:
-        print(f"\n=== Review Summary ===")
-        print(f"Total files: {result.summary.total_files_reviewed}")
-        print(f"Files needing rework: {result.summary.files_requiring_rework}")
-        print(f"Overall: {result.summary.overall_assessment}")
-        print(f"\nKey Issues:")
-        for issue in result.summary.key_issues:
-            print(f"  - {issue}")
-
-        print(f"\n=== Individual Reviews ===")
-        for comment in result.review_comments:
-            print(f"\nFile: {comment.file_name}")
-            print(f"Requires Rework: {comment.requires_rework}")
-            print(f"Comment: {comment.review_comment}")
-            if comment.suggested_improvements_markdown:
-                print(
-                    f"Suggestions:\n{comment.suggested_improvements_markdown}")
-    else:
-        print("Review failed or returned no results.")
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 if __name__ == "__main__":
     asyncio.run(test())
+
+    # result_state = None
+    # async for event in workflow.run_stream(initial_state):
+    #     logger.debug(f"Workflow event: {type(event).__name__}")
+    #     print(f"Event: {event}")
+    #     if isinstance(event, WorkflowOutputEvent):
+    #         result_state = event.data

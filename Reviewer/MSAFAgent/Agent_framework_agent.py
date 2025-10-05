@@ -1,9 +1,10 @@
 import asyncio
+from collections.abc import AsyncIterable
 import os
 import logging
 from typing import List, Dict, Any
 from pydantic import BaseModel
-from agent_framework import ChatAgent
+from agent_framework import ChatAgent, WorkflowEvent
 from agent_framework import Executor, WorkflowBuilder, WorkflowContext, WorkflowOutputEvent, handler
 from typing_extensions import Never
 
@@ -45,7 +46,6 @@ class ReviewState(BaseModel):
     summary: ReviewSummary | None = None
 
 
-# --- Tool Functions for ReAct Agent ---
 class ReviewTools:
     """Tools that the ReAct agent can use to gather context."""
 
@@ -57,46 +57,48 @@ class ReviewTools:
     async def get_file_content(self, file_path: str) -> str:
         """Fetch the full content of a file from the PR branch."""
         try:
+            print(f"[Tool] get_file_content: {file_path}")
             result = await self.git_service.get_file_from_pull_request(
                 self.repo_name, self.pr_number, file_path
             )
             if result and isinstance(result, dict):
-                return result.get("decoded_content", "File not found")
+                decoded = result.get("decoded_content", None)
+                if decoded:
+                    print(
+                        f"[Tool] Fetched content for {file_path} ({len(decoded)} chars)")
+                    return decoded
+                return "File found but no content"
             return "File not found"
         except Exception as e:
             logger.error(f"Error fetching file {file_path}: {e}")
-            return f"Error: {str(e)}"
+            return f"Error fetching file {file_path}: {e}"
 
     async def search_related_files(self, search_term: str) -> str:
         """Search for files related to a given term in the PR."""
         try:
+            print(f"[Tool] search_related_files: {search_term}")
             changed_files = await self.git_service.get_pr_changed_file_paths(
                 self.repo_name, self.pr_number
             )
             matches = [f for f in changed_files if search_term.lower()
                        in f.lower()]
-            return f"Related files: {', '.join(matches)}" if matches else "No related files found"
+            if matches:
+                return f"Related files: {', '.join(matches)}"
+            return "No related files found"
         except Exception as e:
-            logger.error(f"Error searching files: {e}")
-            return f"Error: {str(e)}"
+            logger.error(f"Error searching related files: {e}")
+            return f"Error searching files: {e}"
 
     def get_tools(self):
-        """Return list of tool functions with sync wrappers for agent_framework."""
-
-        def get_file_content_sync(file_path: str) -> str:
-            """Fetch the full content of a file from the PR branch."""
-            loop = asyncio.get_event_loop()
-            return loop.run_until_complete(self.get_file_content(file_path))
-
-        def search_related_files_sync(search_term: str) -> str:
-            """Search for files related to a given term in the PR."""
-            loop = asyncio.get_event_loop()
-            return loop.run_until_complete(self.search_related_files(search_term))
-
-        return [get_file_content_sync, search_related_files_sync]
-
+        """
+        Return the tool functions as async callables directly.
+        Agent Framework will detect and await them automatically.
+        """
+        return [self.get_file_content, self.search_related_files]
 
 # --- Executors ---
+
+
 class ReviewSingleDiffExecutor(BaseModelExecutor):
     """Executor that reviews all diffs using a ReAct agent with tools."""
 
@@ -120,7 +122,8 @@ class ReviewSingleDiffExecutor(BaseModelExecutor):
         self.model.agent = ChatAgent(
             chat_client=self.model.chat_client,
             name=self.model.agent.name,
-            instructions=self.instructions,
+            instructions=self.instructions +
+            '\n\n You must make one tool call per file you are reviewing. Use the tool to get additional context if needed (e.g., get_file_content, search_related_files). Then provide your review following the ReviewComment schema.',
             tools=tools
         )
 
@@ -268,7 +271,7 @@ Provide a ReviewSummary with:
 class ReviewerHandlerAgent:
     """Main handler for PR reviews using agent_framework workflow."""
 
-    def __init__(self, model_id: str = "gpt-5-mini"):
+    def __init__(self, model_id: str = "gpt-4.1-mini"):
         self.model_id = model_id
         self.git_service = git_service_factory("github")
 
@@ -284,7 +287,7 @@ class ReviewerHandlerAgent:
                     parts.append(f.read())
         return "\n\n".join(parts)
 
-    async def run(self, repo_name: str, pr_number: int) -> ReviewState | None:
+    async def run(self, repo_name: str, pr_number: int) -> AsyncIterable[WorkflowEvent]:
         """Run the complete review workflow."""
         logger.info(f"Starting review for {repo_name} PR #{pr_number}")
 
@@ -337,49 +340,50 @@ class ReviewerHandlerAgent:
             .add_edge(review_executor, complete_executor)
             .build()
         )
+        return workflow.run_stream(initial_state)
+        # # Run workflow
+        # result_state = None
+        # async for event in workflow.run_stream(initial_state):
+        #     logger.debug(f"Workflow event: {type(event).__name__}")
+        #     print(f"Event: {event}")
+        #     if isinstance(event, WorkflowOutputEvent):
+        #         result_state = event.data
 
-        # Run workflow
-        result_state = None
-        async for event in workflow.run_stream(initial_state):
-            logger.debug(f"Workflow event: {type(event).__name__}")
-            if isinstance(event, WorkflowOutputEvent):
-                result_state = event.data
-
-        logger.info("Review workflow completed")
-        return result_state
-
-
-# --- Example Usage ---
-async def main():
-    """Example usage of the reviewer workflow."""
-    handler = ReviewerHandlerAgent()
-
-    # Example: Review a PR
-    result = await handler.run(
-        repo_name="LuimesLiam/HomeApp",  # Replace with actual repo
-        pr_number=1  # Replace with actual PR number
-    )
-
-    if result and result.summary:
-        print(f"\n=== Review Summary ===")
-        print(f"Total files: {result.summary.total_files_reviewed}")
-        print(f"Files needing rework: {result.summary.files_requiring_rework}")
-        print(f"Overall: {result.summary.overall_assessment}")
-        print(f"\nKey Issues:")
-        for issue in result.summary.key_issues:
-            print(f"  - {issue}")
-
-        print(f"\n=== Individual Reviews ===")
-        for comment in result.review_comments:
-            print(f"\nFile: {comment.file_name}")
-            print(f"Requires Rework: {comment.requires_rework}")
-            print(f"Comment: {comment.review_comment}")
-            if comment.suggested_improvements_markdown:
-                print(
-                    f"Suggestions:\n{comment.suggested_improvements_markdown}")
-    else:
-        print("Review failed or returned no results.")
+        # logger.info("Review workflow completed")
+        # return result_state
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# # --- Example Usage ---
+# async def main():
+#     """Example usage of the reviewer workflow."""
+#     handler = ReviewerHandlerAgent()
+
+#     # Example: Review a PR
+#     result = await handler.run(
+#         repo_name="LuimesLiam/HomeApp",  # Replace with actual repo
+#         pr_number=1  # Replace with actual PR number
+#     )
+
+#     if result and result.summary:
+#         print(f"\n=== Review Summary ===")
+#         print(f"Total files: {result.summary.total_files_reviewed}")
+#         print(f"Files needing rework: {result.summary.files_requiring_rework}")
+#         print(f"Overall: {result.summary.overall_assessment}")
+#         print(f"\nKey Issues:")
+#         for issue in result.summary.key_issues:
+#             print(f"  - {issue}")
+
+#         print(f"\n=== Individual Reviews ===")
+#         for comment in result.review_comments:
+#             print(f"\nFile: {comment.file_name}")
+#             print(f"Requires Rework: {comment.requires_rework}")
+#             print(f"Comment: {comment.review_comment}")
+#             if comment.suggested_improvements_markdown:
+#                 print(
+#                     f"Suggestions:\n{comment.suggested_improvements_markdown}")
+#     else:
+#         print("Review failed or returned no results.")
+
+
+# if __name__ == "__main__":
+#     asyncio.run(main())
