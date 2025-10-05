@@ -1,3 +1,4 @@
+from MSAFAgent.Agent_framework_agent import ReviewerHandlerAgent
 import asyncio
 import functools
 import json
@@ -9,7 +10,6 @@ import httpx
 from contextlib import asynccontextmanager, suppress
 from dotenv import load_dotenv
 from pydantic import BaseModel
-
 from Agents.agent import ReviewerHandler
 from Models.State import State
 httpx_client: httpx.AsyncClient | None = None
@@ -224,3 +224,41 @@ async def process_review_stream(body: MessageBody, request: Request):
                     await run_task
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+# --- Example Usage ---
+
+@app.post("/review/test")
+async def test():
+    """Example usage of the reviewer workflow."""
+    handler = ReviewerHandlerAgent()
+
+    # Example: Review a PR
+    result = await handler.run(
+        repo_name="LuimesLiam/HomeApp",  # Replace with actual repo
+        pr_number=1  # Replace with actual PR number
+    )
+
+    if result and result.summary:
+        print(f"\n=== Review Summary ===")
+        print(f"Total files: {result.summary.total_files_reviewed}")
+        print(f"Files needing rework: {result.summary.files_requiring_rework}")
+        print(f"Overall: {result.summary.overall_assessment}")
+        print(f"\nKey Issues:")
+        for issue in result.summary.key_issues:
+            print(f"  - {issue}")
+
+        print(f"\n=== Individual Reviews ===")
+        for comment in result.review_comments:
+            print(f"\nFile: {comment.file_name}")
+            print(f"Requires Rework: {comment.requires_rework}")
+            print(f"Comment: {comment.review_comment}")
+            if comment.suggested_improvements_markdown:
+                print(
+                    f"Suggestions:\n{comment.suggested_improvements_markdown}")
+    else:
+        print("Review failed or returned no results.")
+
+
+if __name__ == "__main__":
+    asyncio.run(test())
